@@ -43,41 +43,34 @@ if not hasattr(uproot.source.xrootd.XRootDSource, '_read_real'):
     uproot.source.xrootd.XRootDSource._read = _read
 
 
-class FileMeta(object):
-    __slots__ = ['dataset', 'filename', 'treename', 'numentries']
+class FileKey(object):
+    __slots__ = ['filename', 'treename']
 
-    def __init__(self, dataset, filename, treename, numentries=None):
-        self.dataset = dataset
+    def __init__(self, filename, treename):
         self.filename = filename
         self.treename = treename
-        self.numentries = numentries
 
     def __hash__(self):
-        # As used to lookup numentries, no need for dataset
         return hash((self.filename, self.treename))
 
     def __eq__(self, other):
-        # In case of hash collisions
         return self.filename == other.filename and self.treename == other.treename
 
-    def maybe_populate(self, cache):
-        if cache and self in cache:
-            self.numentries = cache[self]
 
-    @property
-    def populated(self):
-        return self.numentries is not None
+class FileMeta(object):
+    __slots__ = ['numentries']
+
+    def __init__(self, numentries):
+        self.numentries = numentries
 
     def nchunks(self, target_chunksize):
-        if not self.populated:
-            raise RuntimeError
         return max(round(self.numentries / target_chunksize), 1)
 
     def chunks(self, target_chunksize):
         n = self.nchunks(target_chunksize)
         actual_chunksize = math.ceil(self.numentries / n)
         for index in range(n):
-            yield WorkItem(self.dataset, self.filename, self.treename, actual_chunksize, index)
+            yield actual_chunksize, index
 
 
 class WorkItem(object):
@@ -401,12 +394,12 @@ def _normalize_fileset(fileset, treename):
         else:
             raise ValueError('list of filenames in fileset must be a list or a dict')
         for filename in filelist:
-            yield FileMeta(dataset, filename, local_treename)
+            yield dataset, FileKey(filename, local_treename)
 
 
-def _get_metadata(item):
-    nentries = uproot.numentries(item.filename, item.treename)
-    return set_accumulator([FileMeta(item.dataset, item.filename, item.treename, nentries)])
+def _get_metadata(key):
+    nentries = uproot.numentries(key.filename, key.treename)
+    return set_accumulator([(key, FileMeta(nentries))])
 
 
 def run_uproot_job(fileset,
@@ -478,13 +471,16 @@ def run_uproot_job(fileset,
         pre_args = executor_args
 
     fileset = list(_normalize_fileset(fileset, treename))
-    for filemeta in fileset:
-        filemeta.maybe_populate(metadata_cache)
 
     chunks = []
     if maxchunks is None:
-        # this is a bit of an abuse of map-reduce but ok
-        to_get = set(filemeta for filemeta in fileset if not filemeta.populated)
+        filemeta = {}
+        to_get = set()
+        for _, filekey in fileset:
+            if filekey in metadata_cache:
+                filemeta[filekey] = metadata_cache[filekey]
+            else:
+                to_get.add(filekey)
         if len(to_get) > 0:
             out = set_accumulator()
             real_pre_args = {
@@ -494,28 +490,30 @@ def run_uproot_job(fileset,
             real_pre_args.update(pre_args)
             executor(to_get, _get_metadata, out, **real_pre_args)
             while out:
-                item = out.pop()
-                metadata_cache[item] = item.numentries
-            for filemeta in fileset:
-                filemeta.maybe_populate(metadata_cache)
+                key, data = out.pop()
+                metadata_cache[key] = data
+                filemeta[key] = data
         while fileset:
-            filemeta = fileset.pop()
-            for chunk in filemeta.chunks(chunksize):
-                chunks.append(chunk)
+            dataset, filekey = fileset.pop()
+            meta = filemeta.pop(filekey)
+            for actual_chunksize, index in meta.chunks(chunksize):
+                chunks.append(WorkItem(dataset, filekey.filename, filekey.treename, actual_chunksize, index))
     else:
         # get just enough file info to compute chunking
         nchunks = defaultdict(int)
         while fileset:
-            filemeta = fileset.pop()
-            if nchunks[filemeta.dataset] >= maxchunks:
+            dataset, filekey = fileset.pop()
+            if nchunks[dataset] >= maxchunks:
                 continue
-            if not filemeta.populated:
-                filemeta.numentries = _get_metadata(filemeta).pop().numentries
-                metadata_cache[filemeta] = filemeta.numentries
-            for chunk in filemeta.chunks(chunksize):
-                chunks.append(chunk)
-                nchunks[filemeta.dataset] += 1
-                if nchunks[filemeta.dataset] >= maxchunks:
+            if filekey not in metadata_cache:
+                _, meta = _get_metadata(filekey).pop()
+                metadata_cache[filekey] = meta
+            else:
+                meta = metadata_cache[filekey]
+            for actual_chunksize, index in meta.chunks(chunksize):
+                chunks.append(WorkItem(dataset, filekey.filename, filekey.treename, actual_chunksize, index))
+                nchunks[dataset] += 1
+                if nchunks[dataset] >= maxchunks:
                     break
 
     # pop all _work_function args here
