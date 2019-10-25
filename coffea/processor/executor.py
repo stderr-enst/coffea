@@ -1,6 +1,6 @@
 from __future__ import print_function, division
 import concurrent.futures
-from functools import partial
+from functools import partial, wraps
 from itertools import repeat
 import time
 import uproot
@@ -84,12 +84,21 @@ class WorkItem(object):
         self.index = index
 
 
-class _compression_wrapper(object):
+def _compression_wrapper(level, function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        out = function(*args, **kwargs)
+        return lz4f.compress(pickle.dumps(out, protocol=_PICKLE_PROTOCOL), compression_level=level)
+
+    return wrapper
+
+
+class _picklesafe_compression_wrapper(object):
+    '''For futures_executor where the function serializer is pickle'''
     def __init__(self, level, function):
         self.level = level
         self.function = function
 
-    # no @wraps due to pickle
     def __call__(self, *args, **kwargs):
         out = self.function(*args, **kwargs)
         return lz4f.compress(pickle.dumps(out, protocol=_PICKLE_PROTOCOL), compression_level=self.level)
@@ -213,7 +222,7 @@ def futures_executor(items, function, accumulator, **kwargs):
     desc = kwargs.pop('desc', 'Processing')
     clevel = kwargs.pop('compression', 1)
     if clevel is not None:
-        function = _compression_wrapper(clevel, function)
+        function = _picklesafe_compression_wrapper(clevel, function)
     add_fn = _iadd
     if isinstance(pool, concurrent.futures.Executor):
         futures = set(pool.submit(function, item) for item in items)
@@ -248,10 +257,15 @@ def dask_executor(items, function, accumulator, **kwargs):
             Set to ``None`` for no compression.
         priority : int, optional
             Task priority, default 0
+        retries : int, optional
+            Number of retries for failed tasks (default: 3)
         heavy_input : serializable, optional
             Any value placed here will be broadcast to workers and joined to input
             items in a tuple (item, heavy_input) that is passed to function.
+
+            .. note:: If ``heavy_input`` is set, ``function`` is assumed to be pure.
     """
+    from dask.delayed import delayed
     if len(items) == 0:
         return accumulator
     client = kwargs.pop('client')
@@ -259,9 +273,11 @@ def dask_executor(items, function, accumulator, **kwargs):
     status = kwargs.pop('status', True)
     clevel = kwargs.pop('compression', 1)
     priority = kwargs.pop('priority', 0)
+    retries = kwargs.pop('retries', 3)
     heavy_input = kwargs.pop('heavy_input', None)
+    # secret options
     direct_heavy = kwargs.pop('direct_heavy', None)
-    tree_priority_boost = kwargs.pop('tree_priority_boost', False)
+
     reducer = _reduce
     if clevel is not None:
         function = _compression_wrapper(clevel, function)
@@ -270,21 +286,19 @@ def dask_executor(items, function, accumulator, **kwargs):
     if heavy_input is not None:
         heavy_token = client.scatter(heavy_input, broadcast=True, hash=False, direct=direct_heavy)
         items = list(zip(items, repeat(heavy_token)))
-    futures = client.map(function, items, priority=priority)
-    treelvl = 0
-    while len(futures) > 1:
-        if tree_priority_boost:
-            treelvl = treelvl + 1
-        futures = client.map(
-            reducer,
-            [futures[i:i + ntree] for i in range(0, len(futures), ntree)],
-            priority=priority + treelvl,
-        )
+
+    function = delayed(function, pure=(heavy_input is not None))
+    reducer = delayed(reducer, pure=True)
+    work = list(map(function, items))
+    while len(work) > 1:
+        work = list(map(reducer, (work[i:i + ntree] for i in range(0, len(work), ntree))))
+    work = work[0]
+    future = client.compute(work, retries=retries, priority=priority)
     if status:
         from dask.distributed import progress
         # FIXME: fancy widget doesn't appear, have to live with boring pbar
-        progress(futures, multi=True, notebook=False)
-    accumulator += _maybe_decompress(futures.pop().result())
+        progress(future, multi=True, notebook=False)
+    accumulator += _maybe_decompress(future.result())
     return accumulator
 
 
