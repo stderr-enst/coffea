@@ -260,20 +260,25 @@ def dask_executor(items, function, accumulator, **kwargs):
     clevel = kwargs.pop('compression', 1)
     priority = kwargs.pop('priority', 0)
     heavy_input = kwargs.pop('heavy_input', None)
+    direct_heavy = kwargs.pop('direct_heavy', None)
+    tree_priority_boost = kwargs.pop('tree_priority_boost', False)
     reducer = _reduce
     if clevel is not None:
         function = _compression_wrapper(clevel, function)
         reducer = _compression_wrapper(clevel, reducer)
 
     if heavy_input is not None:
-        heavy_token = client.scatter(heavy_input, broadcast=True, hash=False)
+        heavy_token = client.scatter(heavy_input, broadcast=True, hash=False, direct=direct_heavy)
         items = list(zip(items, repeat(heavy_token)))
     futures = client.map(function, items, priority=priority)
+    treelvl = 0
     while len(futures) > 1:
+        if tree_priority_boost:
+            treelvl = treelvl + 1
         futures = client.map(
             reducer,
             [futures[i:i + ntree] for i in range(0, len(futures), ntree)],
-            priority=priority,
+            priority=priority + treelvl,
         )
     if status:
         from dask.distributed import progress
