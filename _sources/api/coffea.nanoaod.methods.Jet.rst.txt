@@ -1,0 +1,7 @@
+Jet
+===
+
+.. currentmodule:: coffea.nanoaod.methods
+
+.. autoclass:: Jet
+   :show-inheritance:
